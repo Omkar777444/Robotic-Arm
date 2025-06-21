@@ -1,92 +1,268 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
-#include "ServoESP32.h"
+#include <ESP32Servo.h>
+#include <iostream>
+#include <sstream>
 
-// Wi-Fi credentials
-const char* ssid = "Robotic arm";
+struct ServoPins {
+  Servo servo;
+  int servoPin;
+  String servoName;
+  int initialPosition;
+};
+
+std::vector<ServoPins> servoPins = {
+  { Servo(), 27 , "Base", 90},
+  { Servo(), 26 , "Shoulder", 90},
+  { Servo(), 25 , "Elbow", 90},
+  { Servo(), 33 , "Gripper", 90},
+  { Servo(), 32 , "Wrist", 90},
+  { Servo(), 14 , "Rotate", 90},
+};
+
+struct RecordedStep {
+  int servoIndex;
+  int value;
+  int delayInStep;
+};
+std::vector<RecordedStep> recordedSteps;
+
+bool recordSteps = false;
+bool playRecordedSteps = false;
+unsigned long previousTimeInMilli = millis();
+
+const char* ssid     = "RobotArm";
 const char* password = "12345678";
 
-// Server on port 80
 AsyncWebServer server(80);
+AsyncWebSocket wsRobotArmInput("/RobotArmInput");
 
-// Create 6 Servo objects
-ServoESP32 servo[6];
-int servoPins[6] = {13, 12, 14, 27, 26, 25}; // Modify based on your wiring
-int servoAngles[6] = {90, 90, 90, 90, 90, 90}; // Initial positions
-
-void setup() {
-  Serial.begin(115200);
-
-  // Connect to Wi-Fi
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.println("Connected to WiFi");
-  Serial.println("IP Address: ");
-  Serial.println(WiFi.localIP());
-
-  // Attach servo motors
-  for (int i = 0; i < 6; i++) {
-    servo[i].attach(servoPins[i]);
-    servo[i].write(servoAngles[i]);
-  }
-
-  // Serve the web page
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/html", htmlPage.c_str());
-  });
-
-  // Handle angle changes
-  server.on("/set", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (request->hasParam("id") && request->hasParam("angle")) {
-      int id = request->getParam("id")->value().toInt();
-      int angle = request->getParam("angle")->value().toInt();
-      if (id >= 0 && id < 6 && angle >= 0 && angle <= 180) {
-        servoAngles[id] = angle;
-        servo[id].write(angle);
-        request->send(200, "text/plain", "OK");
-      } else {
-        request->send(400, "text/plain", "Invalid range");
-      }
-    } else {
-      request->send(400, "text/plain", "Missing params");
-    }
-  });
-
-  server.begin();
-}
-
-// HTML Page with sliders
-const String htmlPage = R"rawliteral(
+const char* htmlHomePage PROGMEM = R"HTMLHOMEPAGE(
 <!DOCTYPE html>
 <html>
-<head>
-  <title>ESP32 Robotic Arm Control</title>
-  <style>
-    body { font-family: Arial; text-align: center; margin-top: 40px; }
-    input[type=range] { width: 300px; }
-    .servo { margin: 20px; }
-  </style>
-</head>
-<body>
-  <h2>ESP32 Robotic Arm Control</h2>
-  <div class='servo'>Servo 1: <input type='range' min='0' max='180' value='90' onchange='updateServo(0,this.value)' /></div>
-  <div class='servo'>Servo 2: <input type='range' min='0' max='180' value='90' onchange='updateServo(1,this.value)' /></div>
-  <div class='servo'>Servo 3: <input type='range' min='0' max='180' value='90' onchange='updateServo(2,this.value)' /></div>
-  <div class='servo'>Servo 4: <input type='range' min='0' max='180' value='90' onchange='updateServo(3,this.value)' /></div>
-  <div class='servo'>Servo 5: <input type='range' min='0' max='180' value='90' onchange='updateServo(4,this.value)' /></div>
-  <div class='servo'>Servo 6: <input type='range' min='0' max='180' value='90' onchange='updateServo(5,this.value)' /></div>
+  <head>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <style>
+    input[type=button] {
+      background-color:red;color:white;border-radius:30px;width:100%;height:40px;font-size:20px;text-align:center;
+    }
+    .noselect {
+      user-select: none;
+    }
+    .slidecontainer {
+      width: 100%;
+    }
+    .slider {
+      width: 100%; height: 20px; border-radius: 5px;
+      background: #d3d3d3; outline: none; opacity: 0.7;
+    }
+    .slider:hover { opacity: 1; }
+    .slider::-webkit-slider-thumb {
+      width: 40px; height: 40px; border-radius: 50%;
+      background: red; cursor: pointer;
+    }
+    </style>
+  </head>
+  <body class="noselect" align="center" style="background-color:white">
+    <h1 style="color: teal;text-align:center;">Hash Include Electronics</h1>
+    <h2 style="color: teal;text-align:center;">Robot Arm Control</h2>
+    
+    <table id="mainTable" style="width:400px;margin:auto;table-layout:fixed" CELLSPACING=10>
+      <tr><td style="text-align:left;font-size:25px"><b>Gripper:</b></td><td colspan=2>
+        <div class="slidecontainer"><input type="range" min="0" max="180" value="90" class="slider" id="Gripper" oninput='sendButtonInput("Gripper",value)'></div>
+      </td></tr>
+      <tr><td style="text-align:left;font-size:25px"><b>Elbow:</b></td><td colspan=2>
+        <div class="slidecontainer"><input type="range" min="0" max="180" value="90" class="slider" id="Elbow" oninput='sendButtonInput("Elbow",value)'></div>
+      </td></tr>
+      <tr><td style="text-align:left;font-size:25px"><b>Shoulder:</b></td><td colspan=2>
+        <div class="slidecontainer"><input type="range" min="0" max="180" value="90" class="slider" id="Shoulder" oninput='sendButtonInput("Shoulder",value)'></div>
+      </td></tr>
+      <tr><td style="text-align:left;font-size:25px"><b>Base:</b></td><td colspan=2>
+        <div class="slidecontainer"><input type="range" min="0" max="180" value="90" class="slider" id="Base" oninput='sendButtonInput("Base",value)'></div>
+      </td></tr>
+      <tr><td style="text-align:left;font-size:25px"><b>Wrist:</b></td><td colspan=2>
+        <div class="slidecontainer"><input type="range" min="0" max="180" value="90" class="slider" id="Wrist" oninput='sendButtonInput("Wrist",value)'></div>
+      </td></tr>
+      <tr><td style="text-align:left;font-size:25px"><b>Rotate:</b></td><td colspan=2>
+        <div class="slidecontainer"><input type="range" min="0" max="180" value="90" class="slider" id="Rotate" oninput='sendButtonInput("Rotate",value)'></div>
+      </td></tr>
+      <tr><td style="text-align:left;font-size:25px"><b>Record:</b></td><td><input type="button" id="Record" value="OFF" ontouchend='onclickButton(this)'></td></tr>
+      <tr><td style="text-align:left;font-size:25px"><b>Play:</b></td><td><input type="button" id="Play" value="OFF" ontouchend='onclickButton(this)'></td></tr>
+    </table>
 
-<script>
-function updateServo(id, angle) {
-  fetch(`/set?id=${id}&angle=${angle}`);
-}
-</script>
-</body>
+    <script>
+      var webSocketRobotArmInputUrl = "ws:\/\/" + window.location.hostname + "/RobotArmInput";
+      var websocketRobotArmInput;
+      
+      function initRobotArmInputWebSocket() {
+        websocketRobotArmInput = new WebSocket(webSocketRobotArmInputUrl);
+        websocketRobotArmInput.onopen = function(event){};
+        websocketRobotArmInput.onclose = function(event){setTimeout(initRobotArmInputWebSocket, 2000);};
+        websocketRobotArmInput.onmessage = function(event) {
+          var keyValue = event.data.split(",");
+          var button = document.getElementById(keyValue[0]);
+          button.value = keyValue[1];
+          if (button.id == "Record" || button.id == "Play") {
+            button.style.backgroundColor = (button.value == "ON" ? "green" : "red");
+            enableDisableButtonsSliders(button);
+          }
+        };
+      }
+      
+      function sendButtonInput(key, value) {
+        websocketRobotArmInput.send(key + "," + value);
+      }
+
+      function onclickButton(button) {
+        button.value = (button.value == "ON") ? "OFF" : "ON";
+        button.style.backgroundColor = (button.value == "ON" ? "green" : "red");
+        sendButtonInput(button.id, (button.value == "ON") ? 1 : 0);
+        enableDisableButtonsSliders(button);
+      }
+
+      function enableDisableButtonsSliders(button) {
+        var ids = ["Gripper", "Elbow", "Shoulder", "Base", "Wrist", "Rotate"];
+        if(button.id == "Play") {
+          let disable = (button.value == "ON") ? "none" : "auto";
+          ids.forEach(id => document.getElementById(id).style.pointerEvents = disable);
+          document.getElementById("Record").style.pointerEvents = disable;
+        }
+        if(button.id == "Record") {
+          let disable = (button.value == "ON") ? "none" : "auto";
+          document.getElementById("Play").style.pointerEvents = disable;
+        }
+      }
+
+      window.onload = initRobotArmInputWebSocket;
+      document.getElementById("mainTable").addEventListener("touchend", function(event){ event.preventDefault(); });
+    </script>
+  </body>
 </html>
-)rawliteral";
+)HTMLHOMEPAGE";
+
+void handleRoot(AsyncWebServerRequest *request) {
+  request->send_P(200, "text/html", htmlHomePage);
+}
+
+void handleNotFound(AsyncWebServerRequest *request) {
+  request->send(404, "text/plain", "File Not Found");
+}
+
+void onRobotArmInputWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  switch (type) {
+    case WS_EVT_CONNECT:
+      Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+      sendCurrentRobotArmState();
+      break;
+    case WS_EVT_DISCONNECT:
+      Serial.printf("WebSocket client #%u disconnected\n", client->id());
+      break;
+    case WS_EVT_DATA: {
+      AwsFrameInfo *info = (AwsFrameInfo*)arg;
+      if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+        std::string myData((char *)data, len);
+        std::istringstream ss(myData);
+        std::string key, value;
+        std::getline(ss, key, ',');
+        std::getline(ss, value, ',');
+        int valueInt = atoi(value.c_str());
+
+        if (key == "Record") {
+          recordSteps = valueInt;
+          if (recordSteps) {
+            recordedSteps.clear();
+            previousTimeInMilli = millis();
+          }
+        } else if (key == "Play") {
+          playRecordedSteps = valueInt;
+        } else {
+          for (int i = 0; i < servoPins.size(); i++) {
+            if (servoPins[i].servoName == key.c_str()) {
+              writeServoValues(i, valueInt);
+              break;
+            }
+          }
+        }
+      }
+      break;
+    }
+    default: break;
+  }
+}
+
+void sendCurrentRobotArmState() {
+  for (auto &pin : servoPins) {
+    wsRobotArmInput.textAll(pin.servoName + "," + pin.servo.read());
+  }
+  wsRobotArmInput.textAll(String("Record,") + (recordSteps ? "ON" : "OFF"));
+  wsRobotArmInput.textAll(String("Play,") + (playRecordedSteps ? "ON" : "OFF"));
+}
+
+void writeServoValues(int servoIndex, int value) {
+  if (recordSteps) {
+    RecordedStep recordedStep;
+    if (recordedSteps.empty()) {
+      for (int i = 0; i < servoPins.size(); i++) {
+        recordedSteps.push_back({i, servoPins[i].servo.read(), 0});
+      }
+    }
+    unsigned long currentTime = millis();
+    recordedStep = {servoIndex, value, (int)(currentTime - previousTimeInMilli)};
+    recordedSteps.push_back(recordedStep);
+    previousTimeInMilli = currentTime;
+  }
+  servoPins[servoIndex].servo.write(value);
+}
+
+void playRecordedRobotArmSteps() {
+  if (recordedSteps.empty()) return;
+
+  for (int i = 0; i < servoPins.size() && playRecordedSteps; i++) {
+    auto &step = recordedSteps[i];
+    int current = servoPins[step.servoIndex].servo.read();
+    while (current != step.value && playRecordedSteps) {
+      current += (current > step.value) ? -1 : 1;
+      servoPins[step.servoIndex].servo.write(current);
+      wsRobotArmInput.textAll(servoPins[step.servoIndex].servoName + "," + current);
+      delay(50);
+    }
+  }
+  delay(2000);
+
+  for (int i = servoPins.size(); i < recordedSteps.size() && playRecordedSteps; i++) {
+    auto &step = recordedSteps[i];
+    delay(step.delayInStep);
+    servoPins[step.servoIndex].servo.write(step.value);
+    wsRobotArmInput.textAll(servoPins[step.servoIndex].servoName + "," + step.value);
+  }
+}
+
+void setUpPinModes() {
+  for (auto &pin : servoPins) {
+    pin.servo.attach(pin.servoPin);
+    pin.servo.write(pin.initialPosition);
+  }
+}
+
+void setup() {
+  setUpPinModes();
+  Serial.begin(115200);
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.onNotFound(handleNotFound);
+  wsRobotArmInput.onEvent(onRobotArmInputWebSocketEvent);
+  server.addHandler(&wsRobotArmInput);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  wsRobotArmInput.cleanupClients();
+  if (playRecordedSteps) playRecordedRobotArmSteps();
+}
+
